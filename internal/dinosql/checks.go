@@ -4,16 +4,18 @@ import (
 	"fmt"
 	"strings"
 
+	nodes "github.com/lfittl/pg_query_go/nodes"
+
 	"github.com/kyleconroy/sqlc/internal/catalog"
 	"github.com/kyleconroy/sqlc/internal/pg"
-	nodes "github.com/lfittl/pg_query_go/nodes"
+	"github.com/kyleconroy/sqlc/internal/postgresql/ast"
 )
 
 func validateParamRef(n nodes.Node) error {
 	var allrefs []nodes.ParamRef
 
 	// Find all parameter references
-	Walk(VisitorFunc(func(node nodes.Node) {
+	ast.Walk(ast.VisitorFunc(func(node nodes.Node) {
 		switch n := node.(type) {
 		case nodes.ParamRef:
 			allrefs = append(allrefs, n)
@@ -33,7 +35,6 @@ func validateParamRef(n nodes.Node) error {
 			}
 		}
 	}
-
 	return nil
 }
 
@@ -42,7 +43,7 @@ type funcCallVisitor struct {
 	err     error
 }
 
-func (v *funcCallVisitor) Visit(node nodes.Node) Visitor {
+func (v *funcCallVisitor) Visit(node nodes.Node) ast.Visitor {
 	if v.err != nil {
 		return nil
 	}
@@ -92,6 +93,58 @@ func (v *funcCallVisitor) Visit(node nodes.Node) Visitor {
 
 func validateFuncCall(c *pg.Catalog, n nodes.Node) error {
 	visitor := funcCallVisitor{catalog: c}
-	Walk(&visitor, n)
+	ast.Walk(&visitor, n)
 	return visitor.err
+}
+
+func validateInsertStmt(stmt nodes.InsertStmt) error {
+	sel, ok := stmt.SelectStmt.(nodes.SelectStmt)
+	if !ok {
+		return nil
+	}
+	if len(sel.ValuesLists) != 1 {
+		return nil
+	}
+
+	colsLen := len(stmt.Cols.Items)
+	valsLen := len(sel.ValuesLists[0])
+	switch {
+	case colsLen > valsLen:
+		return pg.Error{
+			Code:    "42601",
+			Message: "INSERT has more target columns than expressions",
+		}
+	case colsLen < valsLen:
+		return pg.Error{
+			Code:    "42601",
+			Message: "INSERT has more expressions than target columns",
+		}
+	}
+	return nil
+}
+
+// A query can use one (and only one) of the following formats:
+// - positional parameters           $1
+// - named parameter operator        @param
+// - named parameter function calls  sqlc.arg(param)
+func validateParamStyle(n nodes.Node) error {
+	positional := search(n, func(node nodes.Node) bool {
+		_, ok := node.(nodes.ParamRef)
+		return ok
+	})
+	namedFunc := search(n, isNamedParamFunc)
+	namedSign := search(n, isNamedParamSign)
+	for _, check := range []bool{
+		len(positional.Items) > 0 && len(namedSign.Items)+len(namedFunc.Items) > 0,
+		len(namedFunc.Items) > 0 && len(namedSign.Items)+len(positional.Items) > 0,
+		len(namedSign.Items) > 0 && len(positional.Items)+len(namedFunc.Items) > 0,
+	} {
+		if check {
+			return pg.Error{
+				Code:    "", // TODO: Pick a new error code
+				Message: "query mixes positional parameters ($1) and named parameters (sqlc.arg or @arg)",
+			}
+		}
+	}
+	return nil
 }

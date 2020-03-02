@@ -1,10 +1,6 @@
 package dinosql
 
 import (
-	"io/ioutil"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -26,10 +22,10 @@ func TestPluck(t *testing.T) {
 	}
 
 	expected := []string{
-		"SELECT * FROM venue WHERE slug = $1 AND city = $2",
-		"SELECT * FROM venue WHERE slug = $1",
-		"SELECT * FROM venue LIMIT $1",
-		"SELECT * FROM venue OFFSET $1",
+		"\nSELECT * FROM venue WHERE slug = $1 AND city = $2",
+		"\nSELECT * FROM venue WHERE slug = $1",
+		"\nSELECT * FROM venue LIMIT $1",
+		"\nSELECT * FROM venue OFFSET $1",
 	}
 
 	for i, stmt := range tree.Statements {
@@ -92,13 +88,14 @@ func TestLineColumn(t *testing.T) {
 
 func TestExtractArgs(t *testing.T) {
 	queries := []struct {
-		query string
-		count int
+		query       string
+		bindNumbers []int
 	}{
-		{"SELECT * FROM venue WHERE slug = $1 AND city = $2", 2},
-		{"SELECT * FROM venue WHERE slug = $1", 1},
-		{"SELECT * FROM venue LIMIT $1", 1},
-		{"SELECT * FROM venue OFFSET $1", 1},
+		{"SELECT * FROM venue WHERE slug = $1 AND city = $2", []int{1, 2}},
+		{"SELECT * FROM venue WHERE slug = $1 AND region = $2 AND city = $3 AND country = $2", []int{1, 2, 3, 2}},
+		{"SELECT * FROM venue WHERE slug = $1", []int{1}},
+		{"SELECT * FROM venue LIMIT $1", []int{1}},
+		{"SELECT * FROM venue OFFSET $1", []int{1}},
 	}
 	for _, q := range queries {
 		tree, err := pg.Parse(q.query)
@@ -110,96 +107,80 @@ func TestExtractArgs(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-			if len(refs) != q.count {
-				t.Errorf("expected %d refs, got %d", q.count, len(refs))
+			nums := make([]int, len(refs))
+			for i, n := range refs {
+				nums[i] = n.ref.Number
+			}
+			if diff := cmp.Diff(q.bindNumbers, nums); diff != "" {
+				t.Errorf("expected bindings %v, got %v", q.bindNumbers, nums)
 			}
 		}
 	}
 }
 
-func cmpDirectory(t *testing.T, dir string, actual map[string]string) {
-	t.Helper()
-
-	files, err := ioutil.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
+func TestRewriteParameters(t *testing.T) {
+	queries := []struct {
+		orig string
+		new  string
+	}{
+		{"SELECT * FROM venue WHERE slug = $1 AND city = $3 AND bar = $2", "SELECT * FROM venue WHERE slug = ? AND city = ? AND bar = ?"},
+		{"DELETE FROM venue WHERE slug = $1 AND slug = $1", "DELETE FROM venue WHERE slug = ? AND slug = ?"},
+		{"SELECT * FROM venue LIMIT $1", "SELECT * FROM venue LIMIT ?"},
 	}
-
-	expected := map[string]string{}
-
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-		if !strings.HasSuffix(file.Name(), ".go") {
-			continue
-		}
-		if strings.HasSuffix(file.Name(), "_test.go") {
-			continue
-		}
-		blob, err := ioutil.ReadFile(filepath.Join(dir, file.Name()))
+	for _, q := range queries {
+		tree, err := pg.Parse(q.orig)
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected[file.Name()] = string(blob)
-	}
-
-	if !cmp.Equal(expected, actual) {
-		t.Errorf("%s contents differ", dir)
-		for name, contents := range expected {
-			if actual[name] == "" {
-				t.Errorf("%s is empty", name)
-				continue
+		for _, stmt := range tree.Statements {
+			refs := findParameters(stmt)
+			if err != nil {
+				t.Error(err)
 			}
-			if diff := cmp.Diff(contents, actual[name]); diff != "" {
-				t.Errorf("%s differed (-want +got):\n%s", name, diff)
+			edits, err := rewriteNumberedParameters(refs, stmt.(nodes.RawStmt), q.orig)
+			if err != nil {
+				t.Error(err)
+			}
+			rewritten, err := editQuery(q.orig, edits)
+			if err != nil {
+				t.Error(err)
+			}
+			if rewritten != q.new {
+				t.Errorf("expected %q, got %q", q.new, rewritten)
 			}
 		}
 	}
 }
 
-func TestParseSchema(t *testing.T) {
-	c, err := ParseCatalog(filepath.Join("testdata", "ondeck", "schema"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	q, err := ParseQueries(c, GenerateSettings{}, PackageSettings{
-		Queries: filepath.Join("testdata", "ondeck", "query"),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("default", func(t *testing.T) {
-		output, err := Generate(q, GenerateSettings{}, PackageSettings{
-			Name: "ondeck",
-		})
-		if err != nil {
-			t.Fatal(err)
+func TestParseMetadata(t *testing.T) {
+	for _, query := range []string{
+		`-- name: CreateFoo, :one`,
+		`-- name: 9Foo_, :one`,
+		`-- name: CreateFoo :two`,
+		`-- name: CreateFoo`,
+		`-- name: CreateFoo :one something`,
+		`-- name: `,
+	} {
+		if _, _, err := ParseMetadata(query, CommentSyntaxDash); err == nil {
+			t.Errorf("expected invalid metadata: %q", query)
 		}
-
-		cmpDirectory(t, filepath.Join("testdata", "ondeck"), output)
-	})
-
-	t.Run("prepared", func(t *testing.T) {
-		output, err := Generate(q, GenerateSettings{}, PackageSettings{
-			Name:                "prepared",
-			EmitPreparedQueries: true,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		cmpDirectory(t, filepath.Join("testdata", "ondeck", "prepared"), output)
-	})
+	}
 }
 
-func TestCompile(t *testing.T) {
-	cmd := exec.Command("go", "build", "-mod", "readonly", "./...")
-	cmd.Dir = filepath.Join("testdata", "ondeck")
-	output, err := cmd.CombinedOutput()
+func TestExpand(t *testing.T) {
+	// pretend that foo has two columns, a and b
+	raw := `SELECT *, *, foo.* FROM foo`
+	expected := `SELECT a, b, a, b, foo.a, foo.b FROM foo`
+	edits := []edit{
+		{7, "*", "a, b"},
+		{10, "*", "a, b"},
+		{13, "foo.*", "foo.a, foo.b"},
+	}
+	actual, err := editQuery(raw, edits)
 	if err != nil {
-		t.Errorf("%s: %s", err, string(output))
+		t.Error(err)
+	}
+	if expected != actual {
+		t.Errorf("mismatch:\nexpected: %s\n  acutal: %s", expected, actual)
 	}
 }

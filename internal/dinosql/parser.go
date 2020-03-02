@@ -1,6 +1,7 @@
 package dinosql
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -14,6 +15,7 @@ import (
 	"github.com/kyleconroy/sqlc/internal/catalog"
 	core "github.com/kyleconroy/sqlc/internal/pg"
 	"github.com/kyleconroy/sqlc/internal/postgres"
+	"github.com/kyleconroy/sqlc/internal/postgresql/ast"
 
 	"github.com/davecgh/go-spew/spew"
 	pg "github.com/lfittl/pg_query_go"
@@ -57,38 +59,57 @@ func (e *ParserErr) Error() string {
 	return fmt.Sprintf("multiple errors: %d errors", len(e.Errs))
 }
 
-func ParseCatalog(schema string) (core.Catalog, error) {
-	f, err := os.Stat(schema)
+func ReadSQLFiles(path string) ([]string, error) {
+	f, err := os.Stat(path)
 	if err != nil {
-		return core.Catalog{}, fmt.Errorf("path %s does not exist", schema)
+		return nil, fmt.Errorf("path %s does not exist", path)
 	}
 
-	var files []os.FileInfo
+	var files []string
 	if f.IsDir() {
-		files, err = ioutil.ReadDir(schema)
+		listing, err := ioutil.ReadDir(path)
 		if err != nil {
-			return core.Catalog{}, err
+			return nil, err
+		}
+		for _, f := range listing {
+			files = append(files, filepath.Join(path, f.Name()))
 		}
 	} else {
-		files = append(files, f)
+		files = append(files, path)
+	}
+
+	var sql []string
+	for _, filename := range files {
+		if !strings.HasSuffix(filename, ".sql") {
+			continue
+		}
+		if strings.HasPrefix(filepath.Base(filename), ".") {
+			continue
+		}
+		// Remove golang-migrate rollback files.
+		if strings.HasSuffix(filename, ".down.sql") {
+			continue
+		}
+		sql = append(sql, filename)
+	}
+	return sql, nil
+}
+
+func ParseCatalog(schema string) (core.Catalog, error) {
+	files, err := ReadSQLFiles(schema)
+	if err != nil {
+		return core.Catalog{}, err
 	}
 
 	merr := NewParserErr()
 	c := core.NewCatalog()
-	for _, f := range files {
-		if !strings.HasSuffix(f.Name(), ".sql") {
-			continue
-		}
-		if strings.HasPrefix(f.Name(), ".") {
-			continue
-		}
-		filename := filepath.Join(schema, f.Name())
+	for _, filename := range files {
 		blob, err := ioutil.ReadFile(filename)
 		if err != nil {
 			merr.Add(filename, "", 0, err)
 			continue
 		}
-		contents := RemoveGooseRollback(string(blob))
+		contents := RemoveRollbackStatements(string(blob))
 		tree, err := pg.Parse(contents)
 		if err != nil {
 			merr.Add(filename, contents, 0, err)
@@ -105,6 +126,11 @@ func ParseCatalog(schema string) (core.Catalog, error) {
 			}
 		}
 	}
+
+	// The pg_temp schema is scoped to the current session. Remove it from the
+	// catalog so that other queries can not read from it.
+	delete(c.Schemas, "pg_temp")
+
 	if len(merr.Errs) > 0 {
 		return c, merr
 	}
@@ -151,49 +177,55 @@ type Parameter struct {
 // Name and Cmd may be empty
 // Maybe I don't need the SQL string if I have the raw Stmt?
 type Query struct {
-	SQL     string
-	Columns []core.Column
-	Params  []Parameter
-	Name    string
-	Cmd     string // TODO: Pick a better name. One of: one, many, exec, execrows
+	SQL      string
+	Columns  []core.Column
+	Params   []Parameter
+	Name     string
+	Cmd      string // TODO: Pick a better name. One of: one, many, exec, execrows
+	Comments []string
 
 	// XXX: Hack
-	NeedsEdit bool
-	Filename  string
+	Filename string
 }
 
 type Result struct {
-	Settings GenerateSettings
-	Queries  []*Query
-	Catalog  core.Catalog
+	Queries []*Query
+	Catalog core.Catalog
 }
 
-func ParseQueries(c core.Catalog, settings GenerateSettings, pkg PackageSettings) (*Result, error) {
-	f, err := os.Stat(pkg.Queries)
+type ParserOpts struct {
+	UsePositionalParameters bool
+}
+
+func ParseQueries(c core.Catalog, queries string, opts ParserOpts) (*Result, error) {
+	f, err := os.Stat(queries)
 	if err != nil {
-		return nil, fmt.Errorf("path %s does not exist", pkg.Queries)
+		return nil, fmt.Errorf("path %s does not exist", queries)
 	}
 
-	var files []os.FileInfo
+	var files []string
 	if f.IsDir() {
-		files, err = ioutil.ReadDir(pkg.Queries)
+		listing, err := ioutil.ReadDir(queries)
 		if err != nil {
 			return nil, err
 		}
+		for _, f := range listing {
+			files = append(files, filepath.Join(queries, f.Name()))
+		}
 	} else {
-		files = append(files, f)
+		files = append(files, queries)
 	}
 
 	merr := NewParserErr()
 	var q []*Query
-	for _, f := range files {
-		if !strings.HasSuffix(f.Name(), ".sql") {
+	set := map[string]struct{}{}
+	for _, filename := range files {
+		if !strings.HasSuffix(filename, ".sql") {
 			continue
 		}
-		if strings.HasPrefix(f.Name(), ".") {
+		if strings.HasPrefix(filepath.Base(filename), ".") {
 			continue
 		}
-		filename := filepath.Join(pkg.Queries, f.Name())
 		blob, err := ioutil.ReadFile(filename)
 		if err != nil {
 			merr.Add(filename, "", 0, err)
@@ -206,24 +238,37 @@ func ParseQueries(c core.Catalog, settings GenerateSettings, pkg PackageSettings
 			continue
 		}
 		for _, stmt := range tree.Statements {
-			// line, col := location(source, stmt)
-			query, err := parseQuery(c, stmt, source)
+			query, err := parseQuery(c, stmt, source, opts.UsePositionalParameters)
+			if err == errUnsupportedStatementType {
+				continue
+			}
 			if err != nil {
 				merr.Add(filename, source, location(stmt), err)
 				continue
 			}
-			query.Filename = f.Name()
+			if query.Name != "" {
+				if _, exists := set[query.Name]; exists {
+					merr.Add(filename, source, location(stmt), fmt.Errorf("duplicate query name: %s", query.Name))
+					continue
+				}
+				set[query.Name] = struct{}{}
+			}
+			query.Filename = filepath.Base(filename)
 			if query != nil {
 				q = append(q, query)
 			}
 		}
 	}
-
 	if len(merr.Errs) > 0 {
 		return nil, merr
 	}
-
-	return &Result{Catalog: c, Queries: q, Settings: settings}, nil
+	if len(q) == 0 {
+		return nil, fmt.Errorf("path %s contains no queries", queries)
+	}
+	return &Result{
+		Catalog: c,
+		Queries: q,
+	}, nil
 }
 
 func location(node nodes.Node) int {
@@ -269,81 +314,377 @@ func lineno(source string, head int) (int, int) {
 func pluckQuery(source string, n nodes.RawStmt) (string, error) {
 	head := n.StmtLocation
 	tail := n.StmtLocation + n.StmtLen
-	return strings.TrimSpace(source[head:tail]), nil
+	return source[head:tail], nil
 }
 
 func rangeVars(root nodes.Node) []nodes.RangeVar {
 	var vars []nodes.RangeVar
-	find := VisitorFunc(func(node nodes.Node) {
+	find := ast.VisitorFunc(func(node nodes.Node) {
 		switch n := node.(type) {
 		case nodes.RangeVar:
 			vars = append(vars, n)
 		}
 	})
-	Walk(find, root)
+	ast.Walk(find, root)
 	return vars
 }
 
-// TODO: Validate metadata
-func parseMetadata(t string) (string, string, error) {
+// A query name must be a valid Go identifier
+//
+// https://golang.org/ref/spec#Identifiers
+func validateQueryName(name string) error {
+	if len(name) == 0 {
+		return fmt.Errorf("invalid query name: %q", name)
+	}
+	for i, c := range name {
+		isLetter := unicode.IsLetter(c) || c == '_'
+		isDigit := unicode.IsDigit(c)
+		if i == 0 && !isLetter {
+			return fmt.Errorf("invalid query name %q", name)
+		} else if !(isLetter || isDigit) {
+			return fmt.Errorf("invalid query name %q", name)
+		}
+	}
+	return nil
+}
+
+type CommentSyntax int
+
+const (
+	CommentSyntaxDash CommentSyntax = iota
+	CommentSyntaxStar               // Note: this is the only style supported by the MySQL sqlparser
+	CommentSyntaxHash
+)
+
+func ParseMetadata(t string, commentStyle CommentSyntax) (string, string, error) {
 	for _, line := range strings.Split(t, "\n") {
-		if !strings.HasPrefix(line, "-- name:") {
+		if commentStyle == CommentSyntaxDash && !strings.HasPrefix(line, "-- name:") {
 			continue
 		}
-		part := strings.Split(line, " ")
-		return part[2], strings.TrimSpace(part[3]), nil
+		if commentStyle == CommentSyntaxStar && !strings.HasPrefix(line, "/* name:") {
+			continue
+		}
+		part := strings.Split(strings.TrimSpace(line), " ")
+
+		if commentStyle == CommentSyntaxStar {
+			part = part[:len(part)-1] // removes the trailing "*/" element
+		}
+		if len(part) == 2 {
+			return "", "", fmt.Errorf("missing query type [':one', ':many', ':exec', ':execrows']: %s", line)
+		}
+		if len(part) != 4 {
+			return "", "", fmt.Errorf("invalid query comment: %s", line)
+		}
+		queryName := part[2]
+		queryType := strings.TrimSpace(part[3])
+		switch queryType {
+		case ":one", ":many", ":exec", ":execrows":
+		default:
+			return "", "", fmt.Errorf("invalid query type: %s", queryType)
+		}
+		if err := validateQueryName(queryName); err != nil {
+			return "", "", err
+		}
+		return queryName, queryType, nil
 	}
 	return "", "", nil
 }
 
-func parseQuery(c core.Catalog, stmt nodes.Node, source string) (*Query, error) {
+func validateCmd(n nodes.Node, name, cmd string) error {
+	// TODO: Convert cmd to an enum
+	if !(cmd == ":many" || cmd == ":one") {
+		return nil
+	}
+	var list nodes.List
+	switch stmt := n.(type) {
+	case nodes.SelectStmt:
+		return nil
+	case nodes.DeleteStmt:
+		list = stmt.ReturningList
+	case nodes.InsertStmt:
+		list = stmt.ReturningList
+	case nodes.UpdateStmt:
+		list = stmt.ReturningList
+	default:
+		return nil
+	}
+	if len(list.Items) == 0 {
+		return fmt.Errorf("query %q specifies parameter %q without containing a RETURNING clause", name, cmd)
+	}
+	return nil
+}
+
+var errUnsupportedStatementType = errors.New("parseQuery: unsupported statement type")
+
+func parseQuery(c core.Catalog, stmt nodes.Node, source string, rewriteParameters bool) (*Query, error) {
 	if err := validateParamRef(stmt); err != nil {
+		return nil, err
+	}
+	if err := validateParamStyle(stmt); err != nil {
 		return nil, err
 	}
 	raw, ok := stmt.(nodes.RawStmt)
 	if !ok {
-		return nil, nil
+		return nil, errors.New("node is not a statement")
 	}
-	switch raw.Stmt.(type) {
+	switch n := raw.Stmt.(type) {
 	case nodes.SelectStmt:
 	case nodes.DeleteStmt:
 	case nodes.InsertStmt:
+		if err := validateInsertStmt(n); err != nil {
+			return nil, err
+		}
 	case nodes.UpdateStmt:
 	default:
-		return nil, nil
+		return nil, errUnsupportedStatementType
 	}
+
 	rawSQL, err := pluckQuery(source, raw)
 	if err != nil {
 		return nil, err
 	}
+	if rawSQL == "" {
+		return nil, errors.New("missing semicolon at end of file")
+	}
 	if err := validateFuncCall(&c, raw); err != nil {
 		return nil, err
 	}
-	name, cmd, err := parseMetadata(rawSQL)
+	name, cmd, err := ParseMetadata(strings.TrimSpace(rawSQL), CommentSyntaxDash)
 	if err != nil {
 		return nil, err
 	}
+	if err := validateCmd(raw.Stmt, name, cmd); err != nil {
+		return nil, err
+	}
 
+	// Re-write query AST
+	raw, namedParams, edits := rewriteNamedParameters(raw)
 	rvs := rangeVars(raw.Stmt)
 	refs := findParameters(raw.Stmt)
-	params, err := resolveCatalogRefs(c, rvs, refs)
+	if rewriteParameters {
+		edits, err = rewriteNumberedParameters(refs, raw, rawSQL)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		refs = uniqueParamRefs(refs)
+		sort.Slice(refs, func(i, j int) bool { return refs[i].ref.Number < refs[j].ref.Number })
+	}
+	params, err := resolveCatalogRefs(c, rvs, refs, namedParams)
 	if err != nil {
 		return nil, err
 	}
 
-	cols, err := outputColumns(c, raw.Stmt)
+	qc, err := buildQueryCatalog(c, raw.Stmt)
+	if err != nil {
+		return nil, err
+	}
+	cols, err := outputColumns(qc, raw.Stmt)
+	if err != nil {
+		return nil, err
+	}
+
+	expandEdits, err := expand(qc, raw)
+	if err != nil {
+		return nil, err
+	}
+	edits = append(edits, expandEdits...)
+
+	expanded, err := editQuery(rawSQL, edits)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the query string was edited, make sure the syntax is valid
+	if expanded != rawSQL {
+		if _, err := pg.Parse(expanded); err != nil {
+			return nil, fmt.Errorf("edited query syntax is invalid: %w", err)
+		}
+	}
+
+	trimmed, comments, err := stripComments(strings.TrimSpace(expanded))
 	if err != nil {
 		return nil, err
 	}
 
 	return &Query{
-		Cmd:       cmd,
-		Name:      name,
-		Params:    params,
-		Columns:   cols,
-		SQL:       rawSQL,
-		NeedsEdit: needsEdit(stmt),
+		Cmd:      cmd,
+		Comments: comments,
+		Name:     name,
+		Params:   params,
+		Columns:  cols,
+		SQL:      trimmed,
 	}, nil
+}
+
+func rewriteNumberedParameters(refs []paramRef, raw nodes.RawStmt, sql string) ([]edit, error) {
+	edits := make([]edit, len(refs))
+	for i, ref := range refs {
+		edits[i] = edit{
+			Location: ref.ref.Location - raw.StmtLocation,
+			Old:      fmt.Sprintf("$%d", ref.ref.Number),
+			New:      "?",
+		}
+	}
+	return edits, nil
+}
+
+func stripComments(sql string) (string, []string, error) {
+	s := bufio.NewScanner(strings.NewReader(sql))
+	var lines, comments []string
+	for s.Scan() {
+		if strings.HasPrefix(s.Text(), "-- name:") {
+			continue
+		}
+		if strings.HasPrefix(s.Text(), "--") {
+			comments = append(comments, strings.TrimPrefix(s.Text(), "--"))
+			continue
+		}
+		lines = append(lines, s.Text())
+	}
+	return strings.Join(lines, "\n"), comments, s.Err()
+}
+
+type edit struct {
+	Location int
+	Old      string
+	New      string
+}
+
+func expand(qc *QueryCatalog, raw nodes.RawStmt) ([]edit, error) {
+	list := search(raw, func(node nodes.Node) bool {
+		switch node.(type) {
+		case nodes.DeleteStmt:
+		case nodes.InsertStmt:
+		case nodes.SelectStmt:
+		case nodes.UpdateStmt:
+		default:
+			return false
+		}
+		return true
+	})
+	if len(list.Items) == 0 {
+		return nil, nil
+	}
+	var edits []edit
+	for _, item := range list.Items {
+		edit, err := expandStmt(qc, raw, item)
+		if err != nil {
+			return nil, err
+		}
+		edits = append(edits, edit...)
+	}
+	return edits, nil
+}
+
+func expandStmt(qc *QueryCatalog, raw nodes.RawStmt, node nodes.Node) ([]edit, error) {
+	tables, err := sourceTables(qc, node)
+	if err != nil {
+		return nil, err
+	}
+
+	var targets nodes.List
+	switch n := node.(type) {
+	case nodes.DeleteStmt:
+		targets = n.ReturningList
+	case nodes.InsertStmt:
+		targets = n.ReturningList
+	case nodes.SelectStmt:
+		targets = n.TargetList
+	case nodes.UpdateStmt:
+		targets = n.ReturningList
+	default:
+		return nil, fmt.Errorf("outputColumns: unsupported node type: %T", n)
+	}
+
+	var edits []edit
+	for _, target := range targets.Items {
+		res, ok := target.(nodes.ResTarget)
+		if !ok {
+			continue
+		}
+		ref, ok := res.Val.(nodes.ColumnRef)
+		if !ok {
+			continue
+		}
+		if !HasStarRef(ref) {
+			continue
+		}
+		var parts, cols []string
+		for _, f := range ref.Fields.Items {
+			switch field := f.(type) {
+			case nodes.String:
+				parts = append(parts, field.Str)
+			case nodes.A_Star:
+				parts = append(parts, "*")
+			default:
+				return nil, fmt.Errorf("unknown field in ColumnRef: %T", f)
+			}
+		}
+		scope := join(ref.Fields, ".")
+		counts := map[string]int{}
+		if scope == "" {
+			for _, t := range tables {
+				for _, c := range t.Columns {
+					counts[c.Name] += 1
+				}
+			}
+		}
+		for _, t := range tables {
+			if scope != "" && scope != t.Name {
+				continue
+			}
+			for _, c := range t.Columns {
+				cname := c.Name
+				if res.Name != nil {
+					cname = *res.Name
+				}
+				if scope != "" {
+					cname = scope + "." + cname
+				}
+				if counts[cname] > 1 {
+					cname = t.Name + "." + cname
+				}
+				if postgres.IsReservedKeyword(cname) {
+					cname = "\"" + cname + "\""
+				}
+				cols = append(cols, cname)
+			}
+		}
+		edits = append(edits, edit{
+			Location: res.Location - raw.StmtLocation,
+			Old:      strings.Join(parts, "."),
+			New:      strings.Join(cols, ", "),
+		})
+	}
+	return edits, nil
+}
+
+func editQuery(raw string, a []edit) (string, error) {
+	if len(a) == 0 {
+		return raw, nil
+	}
+	sort.Slice(a, func(i, j int) bool { return a[i].Location > a[j].Location })
+	s := raw
+	for _, edit := range a {
+		start := edit.Location
+		if start > len(s) {
+			return "", fmt.Errorf("edit start location is out of bounds")
+		}
+		if len(edit.New) <= 0 {
+			return "", fmt.Errorf("empty edit contents")
+		}
+		if len(edit.Old) <= 0 {
+			return "", fmt.Errorf("empty edit contents")
+		}
+		stop := edit.Location + len(edit.Old) - 1 // Assumes edit.New is non-empty
+		if stop < len(s) {
+			s = s[:start] + edit.New + s[stop+1:]
+		} else {
+			s = s[:start] + edit.New
+		}
+	}
+	return s, nil
 }
 
 type QueryCatalog struct {
@@ -351,23 +692,34 @@ type QueryCatalog struct {
 	ctes    map[string]core.Table
 }
 
-func NewQueryCatalog(c core.Catalog, with *nodes.WithClause) QueryCatalog {
-	ctes := map[string]core.Table{}
+func buildQueryCatalog(c core.Catalog, node nodes.Node) (*QueryCatalog, error) {
+	var with *nodes.WithClause
+	switch n := node.(type) {
+	case nodes.InsertStmt:
+		with = n.WithClause
+	case nodes.UpdateStmt:
+		with = n.WithClause
+	case nodes.SelectStmt:
+		with = n.WithClause
+	default:
+		with = nil
+	}
+	qc := &QueryCatalog{catalog: c, ctes: map[string]core.Table{}}
 	if with != nil {
 		for _, item := range with.Ctes.Items {
 			if cte, ok := item.(nodes.CommonTableExpr); ok {
-				cols, err := outputColumns(c, cte.Ctequery)
+				cols, err := outputColumns(qc, cte.Ctequery)
 				if err != nil {
-					panic(err.Error())
+					return nil, err
 				}
-				ctes[*cte.Ctename] = core.Table{
+				qc.ctes[*cte.Ctename] = core.Table{
 					Name:    *cte.Ctename,
 					Columns: cols,
 				}
 			}
 		}
 	}
-	return QueryCatalog{catalog: c, ctes: ctes}
+	return qc, nil
 }
 
 func (qc QueryCatalog) GetTable(fqn core.FQN) (core.Table, *core.Error) {
@@ -385,6 +737,7 @@ func (qc QueryCatalog) GetTable(fqn core.FQN) (core.Table, *core.Error) {
 		err := core.ErrorRelationDoesNotExist(fqn.Rel)
 		return core.Table{}, &err
 	}
+	table.ID = fqn
 	return table, nil
 }
 
@@ -394,9 +747,8 @@ func (qc QueryCatalog) GetTable(fqn core.FQN) (core.Table, *core.Error) {
 // Return an error if column references don't exist
 // Return an error if a table is referenced twice
 // Return an error if an unknown column is referenced
-func sourceTables(c core.Catalog, node nodes.Node) ([]core.Table, error) {
+func sourceTables(qc *QueryCatalog, node nodes.Node) ([]core.Table, error) {
 	var list nodes.List
-	var with *nodes.WithClause
 	switch n := node.(type) {
 	case nodes.DeleteStmt:
 		list = nodes.List{
@@ -411,7 +763,6 @@ func sourceTables(c core.Catalog, node nodes.Node) ([]core.Table, error) {
 			Items: append(n.FromClause.Items, *n.Relation),
 		}
 	case nodes.SelectStmt:
-		with = n.WithClause
 		list = search(n.FromClause, func(node nodes.Node) bool {
 			_, ok := node.(nodes.RangeVar)
 			return ok
@@ -419,8 +770,6 @@ func sourceTables(c core.Catalog, node nodes.Node) ([]core.Table, error) {
 	default:
 		return nil, fmt.Errorf("sourceTables: unsupported node type: %T", n)
 	}
-
-	qc := NewQueryCatalog(c, with)
 
 	var tables []core.Table
 	for _, item := range list.Items {
@@ -434,6 +783,9 @@ func sourceTables(c core.Catalog, node nodes.Node) ([]core.Table, error) {
 			if cerr != nil {
 				cerr.Location = n.Location
 				return nil, *cerr
+			}
+			if n.Alias != nil {
+				table.Name = *n.Alias.Aliasname
 			}
 			tables = append(tables, table)
 		default:
@@ -456,8 +808,8 @@ func HasStarRef(cf nodes.ColumnRef) bool {
 //
 // Return an error if column references are ambiguous
 // Return an error if column references don't exist
-func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
-	tables, err := sourceTables(c, node)
+func outputColumns(qc *QueryCatalog, node nodes.Node) ([]core.Column, error) {
+	tables, err := sourceTables(qc, node)
 	if err != nil {
 		return nil, err
 	}
@@ -479,8 +831,6 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 	var cols []core.Column
 
 	for _, target := range targets.Items {
-		// spew.Dump(target)
-
 		res, ok := target.(nodes.ResTarget)
 		if !ok {
 			continue
@@ -492,9 +842,40 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 			if res.Name != nil {
 				name = *res.Name
 			}
-			if postgres.IsComparisonOperator(join(n.Name, "")) {
+			switch {
+			case postgres.IsComparisonOperator(join(n.Name, "")):
 				// TODO: Generate a name for these operations
 				cols = append(cols, core.Column{Name: name, DataType: "bool", NotNull: true})
+			case postgres.IsMathematicalOperator(join(n.Name, "")):
+				// TODO: Generate correct numeric type
+				cols = append(cols, core.Column{Name: name, DataType: "pg_catalog.int4", NotNull: true})
+			default:
+				cols = append(cols, core.Column{Name: name, DataType: "any", NotNull: false})
+			}
+
+		case nodes.CaseExpr:
+			name := ""
+			if res.Name != nil {
+				name = *res.Name
+			}
+			// TODO: The TypeCase code has been copied from below. Instead, we need a recurse function to get the type of a node.
+			if tc, ok := n.Defresult.(nodes.TypeCast); ok {
+				if tc.TypeName == nil {
+					return nil, errors.New("no type name type cast")
+				}
+				name := ""
+				if ref, ok := tc.Arg.(nodes.ColumnRef); ok {
+					name = join(ref.Fields, "_")
+				}
+				if res.Name != nil {
+					name = *res.Name
+				}
+				// TODO Validate column names
+				col := catalog.ToColumn(tc.TypeName)
+				col.Name = name
+				cols = append(cols, col)
+			} else {
+				cols = append(cols, core.Column{Name: name, DataType: "any", NotNull: false})
 			}
 
 		case nodes.CoalesceExpr:
@@ -513,6 +894,7 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 
 		case nodes.ColumnRef:
 			if HasStarRef(n) {
+				// TODO: This code is copied in func expand()
 				for _, t := range tables {
 					scope := join(n.Fields, ".")
 					if scope != "" && scope != t.Name {
@@ -524,6 +906,7 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 							cname = *res.Name
 						}
 						cols = append(cols, core.Column{
+							Table:    t.ID,
 							Name:     cname,
 							Scope:    scope,
 							DataType: c.DataType,
@@ -552,7 +935,7 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 				name = *res.Name
 			}
 
-			fun, err := c.LookupFunctionN(fqn, len(n.Args.Items))
+			fun, err := qc.catalog.LookupFunctionN(fqn, len(n.Args.Items))
 			if err == nil {
 				cols = append(cols, core.Column{Name: name, DataType: fun.ReturnType, NotNull: true})
 			} else {
@@ -574,6 +957,14 @@ func outputColumns(c core.Catalog, node nodes.Node) ([]core.Column, error) {
 			col := catalog.ToColumn(n.TypeName)
 			col.Name = name
 			cols = append(cols, col)
+
+		default:
+			name := ""
+			if res.Name != nil {
+				name = *res.Name
+			}
+			cols = append(cols, core.Column{Name: name, DataType: "any", NotNull: false})
+
 		}
 	}
 	return cols, nil
@@ -606,9 +997,11 @@ func outputColumnRefs(res nodes.ResTarget, tables []core.Table, node nodes.Colum
 					cname = *res.Name
 				}
 				cols = append(cols, core.Column{
+					Table:    t.ID,
 					Name:     cname,
 					DataType: c.DataType,
 					NotNull:  c.NotNull,
+					IsArray:  c.IsArray,
 				})
 			}
 		}
@@ -635,12 +1028,14 @@ type paramRef struct {
 	parent nodes.Node
 	rv     *nodes.RangeVar
 	ref    nodes.ParamRef
+	name   string // Named parameter support
 }
 
 type paramSearch struct {
 	parent   nodes.Node
 	rangeVar *nodes.RangeVar
-	refs     map[int]paramRef
+	refs     *[]paramRef
+	seen     map[int]struct{}
 
 	// XXX: Gross state hack for limit
 	limitCount  nodes.Node
@@ -666,10 +1061,13 @@ type limitOffset struct {
 	nodeImpl
 }
 
-func (p *paramSearch) Visit(node nodes.Node) Visitor {
+func (p paramSearch) Visit(node nodes.Node) ast.Visitor {
 	switch n := node.(type) {
 
 	case nodes.A_Expr:
+		p.parent = node
+
+	case nodes.FuncCall:
 		p.parent = node
 
 	case nodes.InsertStmt:
@@ -684,7 +1082,8 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 					continue
 				}
 				// TODO: Out-of-bounds panic
-				p.refs[ref.Number] = paramRef{parent: n.Cols.Items[i], ref: ref, rv: p.rangeVar}
+				*p.refs = append(*p.refs, paramRef{parent: n.Cols.Items[i], ref: ref, rv: n.Relation})
+				p.seen[ref.Location] = struct{}{}
 			}
 			for _, vl := range s.ValuesLists {
 				for i, v := range vl {
@@ -693,7 +1092,8 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 						continue
 					}
 					// TODO: Out-of-bounds panic
-					p.refs[ref.Number] = paramRef{parent: n.Cols.Items[i], ref: ref, rv: p.rangeVar}
+					*p.refs = append(*p.refs, paramRef{parent: n.Cols.Items[i], ref: ref, rv: n.Relation})
+					p.seen[ref.Location] = struct{}{}
 				}
 			}
 		}
@@ -705,8 +1105,12 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 		p.parent = node
 
 	case nodes.SelectStmt:
-		p.limitCount = n.LimitCount
-		p.limitOffset = n.LimitOffset
+		if n.LimitCount != nil {
+			p.limitCount = n.LimitCount
+		}
+		if n.LimitOffset != nil {
+			p.limitOffset = n.LimitOffset
+		}
 
 	case nodes.TypeCast:
 		p.parent = node
@@ -725,7 +1129,7 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 				parent = limitOffset{}
 			}
 		}
-		if _, found := p.refs[n.Number]; found {
+		if _, found := p.seen[n.Location]; found {
 			break
 		}
 
@@ -747,7 +1151,8 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 		}
 
 		if set {
-			p.refs[n.Number] = paramRef{parent: parent, ref: n, rv: p.rangeVar}
+			*p.refs = append(*p.refs, paramRef{parent: parent, ref: n, rv: p.rangeVar})
+			p.seen[n.Location] = struct{}{}
 		}
 		return nil
 	}
@@ -755,32 +1160,10 @@ func (p *paramSearch) Visit(node nodes.Node) Visitor {
 }
 
 func findParameters(root nodes.Node) []paramRef {
-	v := &paramSearch{refs: map[int]paramRef{}}
-	Walk(v, root)
 	refs := make([]paramRef, 0)
-	for _, r := range v.refs {
-		refs = append(refs, r)
-	}
-	sort.Slice(refs, func(i, j int) bool { return refs[i].ref.Number < refs[j].ref.Number })
+	v := paramSearch{seen: make(map[int]struct{}), refs: &refs}
+	ast.Walk(v, root)
 	return refs
-}
-
-type starWalker struct {
-	found bool
-}
-
-func (s *starWalker) Visit(node nodes.Node) Visitor {
-	if _, ok := node.(nodes.A_Star); ok {
-		s.found = true
-		return nil
-	}
-	return s
-}
-
-func needsEdit(root nodes.Node) bool {
-	v := &starWalker{}
-	Walk(v, root)
-	return v.found
 }
 
 type nodeSearch struct {
@@ -788,7 +1171,7 @@ type nodeSearch struct {
 	check func(nodes.Node) bool
 }
 
-func (s *nodeSearch) Visit(node nodes.Node) Visitor {
+func (s *nodeSearch) Visit(node nodes.Node) ast.Visitor {
 	if s.check(node) {
 		s.list.Items = append(s.list.Items, node)
 	}
@@ -797,29 +1180,22 @@ func (s *nodeSearch) Visit(node nodes.Node) Visitor {
 
 func search(root nodes.Node, f func(nodes.Node) bool) nodes.List {
 	ns := &nodeSearch{check: f}
-	Walk(ns, root)
+	ast.Walk(ns, root)
 	return ns.list
 }
 
-func argName(name string) string {
-	out := ""
-	for i, p := range strings.Split(name, "_") {
-		if i == 0 {
-			out += strings.ToLower(p)
-		} else if p == "id" {
-			out += "ID"
-		} else {
-			out += strings.Title(p)
-		}
-	}
-	return out
-}
-
-func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) ([]Parameter, error) {
+func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef, names map[int]string) ([]Parameter, error) {
 	aliasMap := map[string]core.FQN{}
 	// TODO: Deprecate defaultTable
 	var defaultTable *core.FQN
 	var tables []core.FQN
+
+	parameterName := func(n int, defaultName string) string {
+		if n, ok := names[n]; ok {
+			return n
+		}
+		return defaultName
+	}
 
 	for _, rv := range rvs {
 		if rv.Relname == nil {
@@ -870,7 +1246,7 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 			a = append(a, Parameter{
 				Number: ref.ref.Number,
 				Column: core.Column{
-					Name:     "offset",
+					Name:     parameterName(ref.ref.Number, "offset"),
 					DataType: "integer",
 					NotNull:  true,
 				},
@@ -880,16 +1256,31 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 			a = append(a, Parameter{
 				Number: ref.ref.Number,
 				Column: core.Column{
-					Name:     "limit",
+					Name:     parameterName(ref.ref.Number, "limit"),
 					DataType: "integer",
 					NotNull:  true,
 				},
 			})
 
 		case nodes.A_Expr:
-			switch n := n.Lexpr.(type) {
+			// TODO: While this works for a wide range of simple expressions,
+			// more complicated expressions will cause this logic to fail.
+			list := search(n.Lexpr, func(node nodes.Node) bool {
+				_, ok := node.(nodes.ColumnRef)
+				return ok
+			})
+
+			if len(list.Items) == 0 {
+				return nil, core.Error{
+					Code:     "XXXXX",
+					Message:  "no column reference found",
+					Location: n.Location,
+				}
+			}
+
+			switch left := list.Items[0].(type) {
 			case nodes.ColumnRef:
-				items := stringSlice(n.Fields)
+				items := stringSlice(left.Fields)
 				var key, alias string
 				switch len(items) {
 				case 1:
@@ -918,13 +1309,17 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 				for _, table := range search {
 					if c, ok := typeMap[table.Schema][table.Rel][key]; ok {
 						found += 1
+						if ref.name != "" {
+							key = ref.name
+						}
 						a = append(a, Parameter{
 							Number: ref.ref.Number,
 							Column: core.Column{
-								Name:     argName(key),
+								Name:     parameterName(ref.ref.Number, key),
 								DataType: c.DataType,
 								NotNull:  c.NotNull,
 								IsArray:  c.IsArray,
+								Table:    c.Table,
 							},
 						})
 					}
@@ -933,16 +1328,68 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 					return nil, core.Error{
 						Code:     "42703",
 						Message:  fmt.Sprintf("column \"%s\" does not exist", key),
-						Location: n.Location,
+						Location: left.Location,
 					}
 				}
 				if found > 1 {
 					return nil, core.Error{
 						Code:     "42703",
 						Message:  fmt.Sprintf("column reference \"%s\" is ambiguous", key),
-						Location: n.Location,
+						Location: left.Location,
 					}
 				}
+			}
+
+		case nodes.FuncCall:
+			fqn, err := catalog.ParseList(n.Funcname)
+			if err != nil {
+				return nil, err
+			}
+			fun, err := c.LookupFunctionN(fqn, len(n.Args.Items))
+			if err != nil {
+				// Synthesize a function on the fly to avoid returning with an error
+				// for an unknown Postgres function (e.g. defined in an extension)
+				fun = core.Function{
+					Name:       fqn.Rel,
+					ArgN:       len(n.Args.Items),
+					Arguments:  nil,
+					ReturnType: "any",
+				}
+			}
+			for i, item := range n.Args.Items {
+				pr, ok := item.(nodes.ParamRef)
+				if !ok {
+					continue
+				}
+				if pr.Number != ref.ref.Number {
+					continue
+				}
+				if fun.Arguments == nil {
+					a = append(a, Parameter{
+						Number: ref.ref.Number,
+						Column: core.Column{
+							Name:     parameterName(ref.ref.Number, fun.Name),
+							DataType: "any",
+						},
+					})
+					continue
+				}
+				if i >= len(fun.Arguments) {
+					return nil, fmt.Errorf("incorrect number of arguments to %s", fun.Name)
+				}
+				arg := fun.Arguments[i]
+				name := arg.Name
+				if name == "" {
+					name = fun.Name
+				}
+				a = append(a, Parameter{
+					Number: ref.ref.Number,
+					Column: core.Column{
+						Name:     parameterName(ref.ref.Number, name),
+						DataType: arg.DataType,
+						NotNull:  true,
+					},
+				})
 			}
 
 		case nodes.ResTarget:
@@ -950,14 +1397,27 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 				return nil, fmt.Errorf("nodes.ResTarget has nil name")
 			}
 			key := *n.Name
-			if c, ok := typeMap[defaultTable.Schema][defaultTable.Rel][key]; ok {
+
+			// TODO: Deprecate defaultTable
+			schema := defaultTable.Schema
+			rel := defaultTable.Rel
+			if ref.rv != nil {
+				fqn, err := catalog.ParseRange(ref.rv)
+				if err != nil {
+					return nil, err
+				}
+				schema = fqn.Schema
+				rel = fqn.Rel
+			}
+			if c, ok := typeMap[schema][rel][key]; ok {
 				a = append(a, Parameter{
 					Number: ref.ref.Number,
 					Column: core.Column{
-						Name:     argName(key),
+						Name:     parameterName(ref.ref.Number, key),
 						DataType: c.DataType,
 						NotNull:  c.NotNull,
 						IsArray:  c.IsArray,
+						Table:    c.Table,
 					},
 				})
 			} else {
@@ -972,39 +1432,31 @@ func resolveCatalogRefs(c core.Catalog, rvs []nodes.RangeVar, args []paramRef) (
 			if n.TypeName == nil {
 				return nil, fmt.Errorf("nodes.TypeCast has nil type name")
 			}
+			col := catalog.ToColumn(n.TypeName)
+			col.Name = parameterName(ref.ref.Number, col.Name)
 			a = append(a, Parameter{
 				Number: ref.ref.Number,
-				Column: catalog.ToColumn(n.TypeName),
+				Column: col,
 			})
 
 		case nodes.ParamRef:
 			a = append(a, Parameter{Number: ref.ref.Number})
 
 		default:
-			// return nil, fmt.Errorf("unsupported type: %T", n)
+			fmt.Printf("unsupported reference type: %T", n)
 		}
 	}
 	return a, nil
 }
 
-type TypeOverride struct {
-	Package      string `json:"package"`
-	PostgresType string `json:"postgres_type"`
-	GoType       string `json:"go_type"`
-	Null         bool   `json:"null"`
-}
-
-type PackageSettings struct {
-	Name                string `json:"name"`
-	Path                string `json:"path"`
-	Schema              string `json:"schema"`
-	Queries             string `json:"queries"`
-	EmitPreparedQueries bool   `json:"emit_prepared_queries"`
-	EmitJSONTags        bool   `json:"emit_json_tags"`
-}
-
-type GenerateSettings struct {
-	Packages  []PackageSettings `json:"packages"`
-	Overrides []TypeOverride    `json:"overrides"`
-	Rename    map[string]string `json:"rename"`
+func uniqueParamRefs(in []paramRef) []paramRef {
+	m := make(map[int]struct{}, len(in))
+	o := make([]paramRef, 0, len(in))
+	for _, v := range in {
+		if _, ok := m[v.ref.Number]; !ok {
+			m[v.ref.Number] = struct{}{}
+			o = append(o, v)
+		}
+	}
+	return o
 }

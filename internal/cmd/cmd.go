@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -9,11 +8,10 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/kyleconroy/sqlc/internal/dinosql"
-
-	"github.com/davecgh/go-spew/spew"
-	pg "github.com/lfittl/pg_query_go"
 	"github.com/spf13/cobra"
+	yaml "gopkg.in/yaml.v3"
+
+	"github.com/kyleconroy/sqlc/internal/config"
 )
 
 // Do runs the command logic.
@@ -22,12 +20,11 @@ func Do(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int 
 	rootCmd.AddCommand(checkCmd)
 	rootCmd.AddCommand(genCmd)
 	rootCmd.AddCommand(initCmd)
-	rootCmd.AddCommand(parseCmd)
 	rootCmd.AddCommand(versionCmd)
 
 	rootCmd.SetArgs(args)
 	rootCmd.SetIn(stdin)
-	rootCmd.SetErr(stderr)
+	rootCmd.SetOut(stdout)
 	rootCmd.SetErr(stderr)
 
 	err := rootCmd.Execute()
@@ -40,45 +37,34 @@ func Do(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int 
 	return 1
 }
 
+var version string
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Print the sqlc version number",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("v0.0.1")
-	},
-}
-
-var parseCmd = &cobra.Command{
-	Use:   "parse",
-	Short: "Parse and print the AST for a SQL file",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		for _, filename := range args {
-			blob, err := ioutil.ReadFile(filename)
-			if err != nil {
-				return err
-			}
-			tree, err := pg.Parse(string(blob))
-			if err != nil {
-				return err
-			}
-			spew.Dump(tree)
+		if version == "" {
+			// When no version is set, return the next bug fix version
+			// after the most recent tag
+			fmt.Printf("%s\n", "v1.0.1")
+		} else {
+			fmt.Printf("%s\n", version)
 		}
-		return nil
 	},
 }
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Create an empty sqlc.json settings file",
+	Short: "Create an empty sqlc.yaml settings file",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if _, err := os.Stat("sqlc.json"); !os.IsNotExist(err) {
+		if _, err := os.Stat("sqlc.yaml"); !os.IsNotExist(err) {
 			return nil
 		}
-		blob, err := json.MarshalIndent(dinosql.GenerateSettings{}, "  ", "")
+		blob, err := yaml.Marshal(config.V1GenerateSettings{Version: "1"})
 		if err != nil {
 			return err
 		}
-		return ioutil.WriteFile("sqlc.json", blob, 0644)
+		return ioutil.WriteFile("sqlc.yaml", blob, 0644)
 	},
 }
 
@@ -86,95 +72,22 @@ var genCmd = &cobra.Command{
 	Use:   "generate",
 	Short: "Generate Go code from SQL",
 	Run: func(cmd *cobra.Command, args []string) {
-		blob, err := ioutil.ReadFile("sqlc.json")
+		stderr := cmd.ErrOrStderr()
+		dir, err := os.Getwd()
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "error parsing sqlc.json: file does not exist")
+			fmt.Fprintln(stderr, "error parsing sqlc.json: file does not exist")
 			os.Exit(1)
 		}
 
-		var settings dinosql.GenerateSettings
-		if err := json.Unmarshal(blob, &settings); err != nil {
-			switch err.(type) {
-			// TODO: Provide better error messages for sqlc.json parsing
-			// case *json.SyntaxError:
-			// case *json.InvalidUnmarshalError:
-			// case *json.UnmarshalFieldError:
-			// case *json.UnmarshalTypeError:
-			// case *json.UnsupportedTypeError:
-			// case *json.UnsupportedValueError:
-			default:
-				fmt.Fprintf(os.Stderr, "error parsing sqlc.json: %s\n", err)
-			}
-			os.Exit(1)
-		}
-
-		var errored bool
-
-		output := map[string]string{}
-
-		for i, pkg := range settings.Packages {
-			name := pkg.Name
-
-			if pkg.Path == "" {
-				fmt.Fprintf(os.Stderr, "package[%d]: path must be set\n", i)
-				errored = true
-				continue
-			}
-
-			if name == "" {
-				name = filepath.Base(pkg.Path)
-			}
-
-			c, err := dinosql.ParseCatalog(pkg.Schema)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "# package %s\n", name)
-				if parserErr, ok := err.(*dinosql.ParserErr); ok {
-					for _, fileErr := range parserErr.Errs {
-						fmt.Fprintf(os.Stderr, "%s:%d:%d: %s\n", fileErr.Filename, fileErr.Line, fileErr.Column, fileErr.Err)
-					}
-				} else {
-					fmt.Fprintf(os.Stderr, "error parsing schema: %s\n", err)
-				}
-				errored = true
-				continue
-			}
-
-			q, err := dinosql.ParseQueries(c, settings, pkg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "# package %s\n", name)
-				if parserErr, ok := err.(*dinosql.ParserErr); ok {
-					for _, fileErr := range parserErr.Errs {
-						fmt.Fprintf(os.Stderr, "%s:%d:%d: %s\n", fileErr.Filename, fileErr.Line, fileErr.Column, fileErr.Err)
-					}
-				} else {
-					fmt.Fprintf(os.Stderr, "error parsing schema: %s\n", err)
-				}
-				errored = true
-				continue
-			}
-
-			files, err := dinosql.Generate(q, settings, pkg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "# package %s\n", name)
-				fmt.Fprintf(os.Stderr, "error generating code: %s\n", err)
-				errored = true
-				continue
-			}
-
-			for n, source := range files {
-				filename := filepath.Join(pkg.Path, n)
-				output[filename] = source
-			}
-		}
-
-		if errored {
+		output, err := Generate(dir, stderr)
+		if err != nil {
 			os.Exit(1)
 		}
 
 		for filename, source := range output {
 			os.MkdirAll(filepath.Dir(filename), 0755)
 			if err := ioutil.WriteFile(filename, []byte(source), 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "%s: %s\n", filename, err)
+				fmt.Fprintf(stderr, "%s: %s\n", filename, err)
 				os.Exit(1)
 			}
 		}
@@ -185,24 +98,14 @@ var checkCmd = &cobra.Command{
 	Use:   "compile",
 	Short: "Statically check SQL for syntax and type errors",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		blob, err := ioutil.ReadFile("sqlc.json")
+		stderr := cmd.ErrOrStderr()
+		dir, err := os.Getwd()
 		if err != nil {
-			return err
+			fmt.Fprintln(stderr, "error parsing sqlc.json: file does not exist")
+			os.Exit(1)
 		}
-
-		var settings dinosql.GenerateSettings
-		if err := json.Unmarshal(blob, &settings); err != nil {
-			return err
-		}
-
-		for _, pkg := range settings.Packages {
-			c, err := dinosql.ParseCatalog(pkg.Schema)
-			if err != nil {
-				return err
-			}
-			if _, err := dinosql.ParseQueries(c, settings, pkg); err != nil {
-				return err
-			}
+		if _, err := Generate(dir, stderr); err != nil {
+			os.Exit(1)
 		}
 		return nil
 	},

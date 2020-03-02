@@ -35,7 +35,7 @@ func TestUpdate(t *testing.T) {
 			pg.Catalog{
 				Schemas: map[string]pg.Schema{
 					"public": {
-						Enums: map[string]pg.Enum{
+						Types: map[string]pg.Type{
 							"status": pg.Enum{
 								Name: "status",
 								Vals: []string{"open", "closed"},
@@ -105,7 +105,7 @@ func TestUpdate(t *testing.T) {
 						Tables: map[string]pg.Table{
 							"foo": pg.Table{
 								Name:    "foo",
-								Columns: []pg.Column{{Name: "bar", DataType: "text", NotNull: true}},
+								Columns: []pg.Column{{Name: "bar", DataType: "text", NotNull: true, Table: pg.FQN{Schema: "public", Rel: "foo"}}},
 							},
 						},
 					},
@@ -123,7 +123,7 @@ func TestUpdate(t *testing.T) {
 							"foo": pg.Table{
 								Name: "foo",
 								Columns: []pg.Column{
-									{Name: "bar", DataType: "text", IsArray: true, NotNull: true},
+									{Name: "bar", DataType: "text", IsArray: true, NotNull: true, Table: pg.FQN{Schema: "public", Rel: "foo"}},
 								},
 							},
 						},
@@ -142,7 +142,7 @@ func TestUpdate(t *testing.T) {
 						Tables: map[string]pg.Table{
 							"foo": pg.Table{
 								Name:    "foo",
-								Columns: []pg.Column{{Name: "bar", DataType: "text"}},
+								Columns: []pg.Column{{Name: "bar", DataType: "text", Table: pg.FQN{Schema: "public", Rel: "foo"}}},
 							},
 						},
 					},
@@ -160,7 +160,7 @@ func TestUpdate(t *testing.T) {
 						Tables: map[string]pg.Table{
 							"foo": pg.Table{
 								Name:    "foo",
-								Columns: []pg.Column{{Name: "bar", DataType: "text"}},
+								Columns: []pg.Column{{Name: "bar", DataType: "text", Table: pg.FQN{Schema: "public", Rel: "foo"}}},
 							},
 						},
 					},
@@ -178,7 +178,7 @@ func TestUpdate(t *testing.T) {
 						Tables: map[string]pg.Table{
 							"foo": pg.Table{
 								Name:    "foo",
-								Columns: []pg.Column{{Name: "baz", DataType: "text"}},
+								Columns: []pg.Column{{Name: "baz", DataType: "text", Table: pg.FQN{Schema: "public", Rel: "foo"}}},
 							},
 						},
 					},
@@ -196,7 +196,7 @@ func TestUpdate(t *testing.T) {
 						Tables: map[string]pg.Table{
 							"foo": pg.Table{
 								Name:    "foo",
-								Columns: []pg.Column{{Name: "bar", DataType: "bool"}},
+								Columns: []pg.Column{{Name: "bar", DataType: "bool", Table: pg.FQN{Schema: "public", Rel: "foo"}}},
 							},
 						},
 					},
@@ -229,7 +229,7 @@ func TestUpdate(t *testing.T) {
 			pg.Catalog{
 				Schemas: map[string]pg.Schema{
 					"public": {
-						Enums: map[string]pg.Enum{
+						Types: map[string]pg.Type{
 							"status": pg.Enum{
 								Name: "status",
 								Vals: []string{"open", "closed"},
@@ -263,7 +263,7 @@ func TestUpdate(t *testing.T) {
 			pg.Catalog{
 				Schemas: map[string]pg.Schema{
 					"public": {
-						Enums: map[string]pg.Enum{},
+						Types: map[string]pg.Type{},
 						Tables: map[string]pg.Table{
 							"arenas": pg.Table{
 								Name: "arenas",
@@ -324,18 +324,50 @@ func TestUpdate(t *testing.T) {
 		},
 		{
 			`
+			DROP FUNCTION IF EXISTS bar(text);
+			DROP FUNCTION IF EXISTS bar(text) CASCADE;
+			`,
+			pg.NewCatalog(),
+		},
+		{
+			`
 			CREATE TABLE venues (id SERIAL PRIMARY KEY);
 			ALTER TABLE venues DROP CONSTRAINT venues_id_pkey;
 			`,
 			pg.Catalog{
 				Schemas: map[string]pg.Schema{
 					"public": {
-						Enums: map[string]pg.Enum{},
+						Types: map[string]pg.Type{},
 						Tables: map[string]pg.Table{
 							"venues": pg.Table{
 								Name: "venues",
 								Columns: []pg.Column{
-									{Name: "id", DataType: "serial", NotNull: true},
+									{Name: "id", DataType: "serial", NotNull: true, Table: pg.FQN{Schema: "public", Rel: "venues"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{ // first argument has no name
+			`
+			CREATE FUNCTION foo(TEXT) RETURNS bool AS $$ SELECT true $$ LANGUAGE sql;
+			`,
+			pg.Catalog{
+				Schemas: map[string]pg.Schema{
+					"public": {
+						Funcs: map[string][]pg.Function{
+							"foo": []pg.Function{
+								{
+									Name: "foo",
+									Arguments: []pg.Argument{
+										{
+											Name:     "",
+											DataType: "text",
+										},
+									},
+									ReturnType: "bool",
 								},
 							},
 						},
@@ -449,6 +481,92 @@ func TestUpdate(t *testing.T) {
 				},
 			},
 		},
+		{
+			`
+			CREATE TABLE pg_temp.migrate (val INT);
+			INSERT INTO pg_temp.migrate (val) SELECT val FROM old;
+			INSERT INTO new (val) SELECT val FROM pg_temp.migrate;
+			`,
+			pg.Catalog{
+				Schemas: map[string]pg.Schema{
+					"pg_temp": {
+						Tables: map[string]pg.Table{
+							"migrate": pg.Table{
+								Name: "migrate",
+								Columns: []pg.Column{
+									{Name: "val", DataType: "pg_catalog.int4", NotNull: false, Table: pg.FQN{Schema: "pg_temp", Rel: "migrate"}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			`
+			CREATE SCHEMA foo;
+			CREATE TABLE foo.bar (baz text);
+			CREATE TYPE foo.bat AS ENUM ('bat');
+			COMMENT ON SCHEMA foo IS 'Schema comment';
+			COMMENT ON TABLE foo.bar IS 'Table comment';
+			COMMENT ON COLUMN foo.bar.baz IS 'Column comment';
+			COMMENT ON TYPE foo.bat IS 'Enum comment';
+			`,
+			pg.Catalog{
+				Schemas: map[string]pg.Schema{
+					"foo": {
+						Comment: "Schema comment",
+						Tables: map[string]pg.Table{
+							"bar": {
+								Comment: "Table comment",
+								Name:    "bar",
+								Columns: []pg.Column{
+									{
+										Name:     "baz",
+										DataType: "text",
+										Table:    pg.FQN{Schema: "foo", Rel: "bar"},
+										Comment:  "Column comment",
+									},
+								},
+							},
+						},
+						Types: map[string]pg.Type{"bat": pg.Enum{Comment: "Enum comment", Name: "bat", Vals: []string{"bat"}}},
+						Funcs: map[string][]pg.Function{},
+					},
+				},
+			},
+		},
+		{
+			`
+			CREATE TABLE bar (baz text);
+			CREATE TYPE bat AS ENUM ('bat');
+			COMMENT ON TABLE bar IS 'Table comment';
+			COMMENT ON COLUMN bar.baz IS 'Column comment';
+			COMMENT ON TYPE bat IS 'Enum comment';
+			`,
+			pg.Catalog{
+				Schemas: map[string]pg.Schema{
+					"public": {
+						Tables: map[string]pg.Table{
+							"bar": {
+								Comment: "Table comment",
+								Name:    "bar",
+								Columns: []pg.Column{
+									{
+										Name:     "baz",
+										DataType: "text",
+										Table:    pg.FQN{Schema: "public", Rel: "bar"},
+										Comment:  "Column comment",
+									},
+								},
+							},
+						},
+						Types: map[string]pg.Type{"bat": pg.Enum{Comment: "Enum comment", Name: "bat", Vals: []string{"bat"}}},
+						Funcs: map[string][]pg.Function{},
+					},
+				},
+			},
+		},
 	} {
 		test := tc
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
@@ -458,10 +576,12 @@ func TestUpdate(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			delete(c.Schemas, "pg_catalog")
-			delete(test.c.Schemas, "pg_catalog")
+			expected := pg.NewCatalog()
+			for name, schema := range test.c.Schemas {
+				expected.Schemas[name] = schema
+			}
 
-			if diff := cmp.Diff(test.c, c, cmpopts.EquateEmpty()); diff != "" {
+			if diff := cmp.Diff(expected, c, cmpopts.EquateEmpty()); diff != "" {
 				t.Log(test.stmt)
 				t.Errorf("catalog mismatch:\n%s", diff)
 			}

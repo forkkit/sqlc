@@ -56,6 +56,34 @@ func ParseList(list nodes.List) (pg.FQN, error) {
 	return fqn, nil
 }
 
+func ParseString(name string) (pg.FQN, error) {
+	parts := strings.Split(name, ".")
+	var fqn pg.FQN
+	switch len(parts) {
+	case 1:
+		fqn = pg.FQN{
+			Catalog: "",
+			Schema:  "public",
+			Rel:     parts[0],
+		}
+	case 2:
+		fqn = pg.FQN{
+			Catalog: "",
+			Schema:  parts[0],
+			Rel:     parts[1],
+		}
+	case 3:
+		fqn = pg.FQN{
+			Catalog: parts[0],
+			Schema:  parts[1],
+			Rel:     parts[2],
+		}
+	default:
+		return fqn, fmt.Errorf("Invalid FQN: %s", name)
+	}
+	return fqn, nil
+}
+
 func wrap(e pg.Error, loc int) pg.Error {
 	return e
 }
@@ -68,6 +96,7 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 	if !ok {
 		return fmt.Errorf("expected RawStmt; got %T", stmt)
 	}
+
 	switch n := raw.Stmt.(type) {
 
 	case nodes.AlterObjectSchemaStmt:
@@ -97,6 +126,28 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 		}
 
 	case nodes.AlterTableStmt:
+		var implemented bool
+		for _, item := range n.Cmds.Items {
+			switch cmd := item.(type) {
+			case nodes.AlterTableCmd:
+				switch cmd.Subtype {
+				case nodes.AT_AddColumn:
+					implemented = true
+				case nodes.AT_AlterColumnType:
+					implemented = true
+				case nodes.AT_DropColumn:
+					implemented = true
+				case nodes.AT_DropNotNull:
+					implemented = true
+				case nodes.AT_SetNotNull:
+					implemented = true
+				}
+			}
+		}
+
+		if !implemented {
+			return nil
+		}
 		fqn, err := ParseRange(n.Relation)
 		if err != nil {
 			return err
@@ -151,6 +202,7 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 						DataType: join(d.TypeName.Names, "."),
 						NotNull:  isNotNull(d),
 						IsArray:  isArray(d.TypeName),
+						Table:    fqn,
 					})
 
 				case nodes.AT_AlterColumnType:
@@ -171,6 +223,29 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 
 				schema.Tables[fqn.Rel] = table
 			}
+		}
+
+	case nodes.CompositeTypeStmt:
+		fqn, err := ParseRange(n.Typevar)
+		if err != nil {
+			return err
+		}
+		schema, exists := c.Schemas[fqn.Schema]
+		if !exists {
+			return wrap(pg.ErrorSchemaDoesNotExist(fqn.Schema), raw.StmtLocation)
+		}
+		// Because tables have associated data types, the type name must also
+		// be distinct from the name of any existing table in the same
+		// schema.
+		// https://www.postgresql.org/docs/current/sql-createtype.html
+		if _, exists := schema.Tables[fqn.Rel]; exists {
+			return wrap(pg.ErrorRelationAlreadyExists(fqn.Rel), raw.StmtLocation)
+		}
+		if _, exists := schema.Types[fqn.Rel]; exists {
+			return wrap(pg.ErrorRelationAlreadyExists(fqn.Rel), raw.StmtLocation)
+		}
+		schema.Types[fqn.Rel] = pg.CompositeType{
+			Name: fqn.Rel,
 		}
 
 	case nodes.CreateStmt:
@@ -197,6 +272,7 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 					DataType: join(n.TypeName.Names, "."),
 					NotNull:  isNotNull(n),
 					IsArray:  isArray(n.TypeName),
+					Table:    fqn,
 				})
 			}
 		}
@@ -211,10 +287,17 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 		if !exists {
 			return wrap(pg.ErrorSchemaDoesNotExist(fqn.Schema), raw.StmtLocation)
 		}
-		if _, exists := schema.Enums[fqn.Rel]; exists {
+		// Because tables have associated data types, the type name must also
+		// be distinct from the name of any existing table in the same
+		// schema.
+		// https://www.postgresql.org/docs/current/sql-createtype.html
+		if _, exists := schema.Tables[fqn.Rel]; exists {
+			return wrap(pg.ErrorRelationAlreadyExists(fqn.Rel), raw.StmtLocation)
+		}
+		if _, exists := schema.Types[fqn.Rel]; exists {
 			return wrap(pg.ErrorTypeAlreadyExists(fqn.Rel), raw.StmtLocation)
 		}
-		schema.Enums[fqn.Rel] = pg.Enum{
+		schema.Types[fqn.Rel] = pg.Enum{
 			Name: fqn.Rel,
 			Vals: stringSlice(n.Vals),
 		}
@@ -222,10 +305,12 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 	case nodes.CreateSchemaStmt:
 		name := *n.Schemaname
 		if _, exists := c.Schemas[name]; exists {
-			return wrap(pg.ErrorSchemaAlreadyExists(name), raw.StmtLocation)
+			if !n.IfNotExists {
+				return wrap(pg.ErrorSchemaAlreadyExists(name), raw.StmtLocation)
+			}
+		} else {
+			c.Schemas[name] = pg.NewSchema()
 		}
-		c.Schemas[name] = pg.NewSchema()
-
 	case nodes.DropStmt:
 		for _, obj := range n.Objects.Items {
 			if n.RemoveType == nodes.OBJECT_TABLE || n.RemoveType == nodes.OBJECT_TYPE {
@@ -258,8 +343,8 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 					}
 
 				case nodes.OBJECT_TYPE:
-					if _, exists := schema.Enums[fqn.Rel]; exists {
-						delete(schema.Enums, fqn.Rel)
+					if _, exists := schema.Types[fqn.Rel]; exists {
+						delete(schema.Types, fqn.Rel)
 					} else if !n.MissingOk {
 						return wrap(pg.ErrorTypeDoesNotExist(fqn.Rel), raw.StmtLocation)
 					}
@@ -351,8 +436,12 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 		args := make([]pg.Argument, arity)
 		for i, item := range n.Parameters.Items {
 			arg := item.(nodes.FunctionParameter)
+			var name string
+			if arg.Name != nil {
+				name = *arg.Name
+			}
 			args[i] = pg.Argument{
-				Name:       *arg.Name,
+				Name:       name,
 				DataType:   join(arg.ArgType.Names, "."),
 				HasDefault: arg.Defexpr != nil,
 			}
@@ -364,6 +453,108 @@ func Update(c *pg.Catalog, stmt nodes.Node) error {
 			Arguments:  args,
 			ReturnType: join(n.ReturnType.Names, "."),
 		})
+
+	case nodes.CommentStmt:
+		switch n.Objtype {
+
+		case nodes.OBJECT_SCHEMA:
+			name := n.Object.(nodes.String).Str
+			schema, exists := c.Schemas[name]
+			if !exists {
+				return wrap(pg.ErrorSchemaDoesNotExist(name), raw.StmtLocation)
+			}
+			if n.Comment != nil {
+				schema.Comment = *n.Comment
+			} else {
+				schema.Comment = ""
+			}
+			c.Schemas[name] = schema
+
+		case nodes.OBJECT_TABLE:
+			fqn, err := ParseList(n.Object.(nodes.List))
+			if err != nil {
+				return err
+			}
+			schema, exists := c.Schemas[fqn.Schema]
+			if !exists {
+				return wrap(pg.ErrorSchemaDoesNotExist(fqn.Schema), raw.StmtLocation)
+			}
+			table, exists := schema.Tables[fqn.Rel]
+			if !exists {
+				return wrap(pg.ErrorRelationDoesNotExist(fqn.Rel), raw.StmtLocation)
+			}
+			if n.Comment != nil {
+				table.Comment = *n.Comment
+			} else {
+				table.Comment = ""
+			}
+			schema.Tables[fqn.Rel] = table
+
+		case nodes.OBJECT_COLUMN:
+			colParts := stringSlice(n.Object.(nodes.List))
+			var fqn pg.FQN
+			var col string
+			switch len(colParts) {
+			case 2:
+				col = colParts[1]
+				fqn = pg.FQN{Schema: "public", Rel: colParts[0]}
+			case 3:
+				col = colParts[2]
+				fqn = pg.FQN{Schema: colParts[0], Rel: colParts[1]}
+			case 4:
+				col = colParts[3]
+				fqn = pg.FQN{Catalog: colParts[0], Schema: colParts[1], Rel: colParts[2]}
+			default:
+				return fmt.Errorf("column specifier %q is not the proper format, expected '[catalog.][schema.]colname.tablename'", strings.Join(colParts, "."))
+			}
+			schema, exists := c.Schemas[fqn.Schema]
+			if !exists {
+				return wrap(pg.ErrorSchemaDoesNotExist(fqn.Schema), raw.StmtLocation)
+			}
+			table, exists := schema.Tables[fqn.Rel]
+			if !exists {
+				return wrap(pg.ErrorRelationDoesNotExist(fqn.Rel), raw.StmtLocation)
+			}
+			idx := -1
+			for i, c := range table.Columns {
+				if c.Name == col {
+					idx = i
+				}
+			}
+			if idx < 0 {
+				return wrap(pg.ErrorColumnDoesNotExist(table.Name, col), raw.StmtLocation)
+			}
+			if n.Comment != nil {
+				table.Columns[idx].Comment = *n.Comment
+			} else {
+				table.Columns[idx].Comment = ""
+			}
+
+		case nodes.OBJECT_TYPE:
+			fqn, err := ParseList(n.Object.(nodes.TypeName).Names)
+			if err != nil {
+				return err
+			}
+			schema, exists := c.Schemas[fqn.Schema]
+			if !exists {
+				return wrap(pg.ErrorSchemaDoesNotExist(fqn.Schema), raw.StmtLocation)
+			}
+			typ, exists := schema.Types[fqn.Rel]
+			if !exists {
+				return wrap(pg.ErrorRelationDoesNotExist(fqn.Rel), raw.StmtLocation)
+			}
+			switch t := typ.(type) {
+			case pg.Enum:
+				if n.Comment != nil {
+					t.Comment = *n.Comment
+				} else {
+					t.Comment = ""
+				}
+				schema.Types[fqn.Rel] = t
+			}
+
+		}
+
 	}
 	return nil
 }
